@@ -1,0 +1,10 @@
+# Internal marketing content, not part of the shipped widget
+linkedin-post.md
+linkedin-image.png
+linkedin-video.mp4
+linkedin-video-square.mp4
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store

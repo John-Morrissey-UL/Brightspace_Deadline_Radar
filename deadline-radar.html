@@ -1,0 +1,1059 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deadline Radar</title>
+<!--
+  Deadline Radar — a cross-module view of assignment + quiz windows across the
+  courses you pick ("my program"), filtered by the role(s) you hold, with a
+  pressure signal weighted by each item's % of the module grade rather than a
+  raw item count. Read-only; nothing is ever written back.
+
+  LIVE DATA: when served from your Brightspace domain it uses your own login
+  session (credentials: 'include') and these read-only Valence routes —
+
+    API versions              GET /d2l/api/versions/
+    My courses + my role      GET /d2l/api/lp/{lp}/enrollments/myenrollments/?isActive=true
+                                → OrgUnit.{Id,Name,Code,Type}, Access.ClasslistRoleName
+    Assignments               GET /d2l/api/le/{le}/{ou}/dropbox/folders/
+                                → Id, Name, DueDate, Availability.{StartDate,EndDate}, GradeItemId
+    Assignment special access GET /d2l/api/le/{le}/{ou}/dropbox/folders/{id}/specialaccess/
+    Quizzes                   GET /d2l/api/le/{le}/{ou}/quizzes/
+                                → Id, Name, StartDate, EndDate, DueDate, GradeItemId
+    Quiz special access       GET /d2l/api/le/{le}/{ou}/quizzes/{id}/specialaccess/
+    Grade item weights        GET /d2l/api/le/{le}/{ou}/grades/  → Id, Weight, MaxPoints
+
+  WEIGHT NOTE: in a weighted gradebook we use each item's Weight field; for a
+  categorised gradebook that is the item's weight within its category, used
+  here as a proxy for "how heavy". In a points gradebook we fall back to the
+  item's share of total MaxPoints. Adjust buildWeightMap() if your scheme
+  needs exact final-grade contribution.
+
+  Opened outside Brightspace (double-clicked), the API calls can't authenticate,
+  so the page shows a "connect from Brightspace" message instead of any data.
+-->
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #f3f5f9;
+    --panel: #ffffff;
+    --panel-2: #f7f9fc;
+    --panel-hover: #f0f3f9;
+    --border: #e6eaf1;
+    --border-strong: #d6dce6;
+    --text: #17202b;
+    --muted: #64717f;
+    --faint: #98a4b2;
+    --accent: #3457d5;
+    --accent-ink: #2942ad;
+    --accent-soft: rgba(52, 87, 213, .10);
+
+    --grid: #eceff4;
+    --ink-primary: #14202b;
+    --ink-secondary: #52514e;
+    --series-assign: #2a78d6;   /* categorical slot 1 */
+    --series-quiz:   #6a4fd0;   /* categorical slot 7, lifted for contrast */
+    --ord-1: #a9cbf3; --ord-2: #6da7ec; --ord-3: #2a78d6; --ord-4: #184f95;
+    --good: #0ca30c; --warning: #f0a413; --serious: #ec7a45; --critical: #dc3b3b;
+
+    --shadow-sm: 0 1px 2px rgba(16, 24, 40, .05);
+    --shadow: 0 1px 3px rgba(16, 24, 40, .06), 0 8px 24px -10px rgba(16, 24, 40, .12);
+    --radius: 16px;
+    --radius-sm: 10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --bg: #10141b; --panel: #191f29; --panel-2: #1e2530; --panel-hover: #232b38;
+      --border: #2b3542; --border-strong: #3a4655; --text: #e9edf3; --muted: #9aa7b6; --faint: #6b7889;
+      --accent: #6f8cf5; --accent-ink: #93a9f8; --accent-soft: rgba(111, 140, 245, .16);
+      --grid: #262f3b; --ink-primary: #ffffff; --ink-secondary: #c3c2b7;
+      --series-assign: #4b93e8; --series-quiz: #9b8bef;
+      --ord-1: #2c4a70; --ord-2: #2f74c9; --ord-3: #4b93e8; --ord-4: #9cc2f2;
+      --good: #46c088; --warning: #e8b23c; --serious: #ef8a5a; --critical: #ec5e5e;
+      --shadow-sm: 0 1px 2px rgba(0,0,0,.4);
+      --shadow: 0 1px 3px rgba(0,0,0,.4), 0 10px 28px -12px rgba(0,0,0,.6);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #10141b; --panel: #191f29; --panel-2: #1e2530; --panel-hover: #232b38;
+    --border: #2b3542; --border-strong: #3a4655; --text: #e9edf3; --muted: #9aa7b6; --faint: #6b7889;
+    --accent: #6f8cf5; --accent-ink: #93a9f8; --accent-soft: rgba(111, 140, 245, .16);
+    --grid: #262f3b; --ink-primary: #ffffff; --ink-secondary: #c3c2b7;
+    --series-assign: #4b93e8; --series-quiz: #9b8bef;
+    --ord-1: #2c4a70; --ord-2: #2f74c9; --ord-3: #4b93e8; --ord-4: #9cc2f2;
+    --good: #46c088; --warning: #e8b23c; --serious: #ef8a5a; --critical: #ec5e5e;
+    --shadow-sm: 0 1px 2px rgba(0,0,0,.4);
+    --shadow: 0 1px 3px rgba(0,0,0,.4), 0 10px 28px -12px rgba(0,0,0,.6);
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+  body { margin: 0; font-family: "Segoe UI", system-ui, -apple-system, Arial, sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 0 20px 56px; }
+
+  /* ---------- App bar ---------- */
+  .appbar { position: sticky; top: 0; z-index: 20; background: color-mix(in srgb, var(--bg) 82%, transparent); -webkit-backdrop-filter: saturate(1.4) blur(10px); backdrop-filter: saturate(1.4) blur(10px); border-bottom: 1px solid var(--border); }
+  .appbar-inner { max-width: 1240px; margin: 0 auto; padding: 12px 20px; display: flex; align-items: center; gap: 14px; }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .glyph { width: 38px; height: 38px; flex: none; }
+  .glyph .ring { fill: none; stroke: var(--accent); stroke-opacity: .32; stroke-width: 1.4; }
+  .glyph .grid-l { stroke: var(--accent); stroke-opacity: .22; stroke-width: 1; }
+  .glyph .blip { fill: var(--critical); }
+  .glyph .sweep-rot { transform-origin: 20px 20px; animation: sweep 3.6s linear infinite; }
+  .glyph .sweep { stroke: var(--accent); stroke-width: 2; stroke-linecap: round; }
+  @keyframes sweep { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .glyph .sweep-rot { animation: none; } }
+  .brand h1 { font-size: 1.15rem; margin: 0; letter-spacing: -.01em; }
+  .brand .tagline { font-size: .76rem; color: var(--muted); }
+  .appbar-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+  .mode-badge { font-size: .74rem; font-weight: 600; padding: 4px 11px; border-radius: 999px; display: inline-flex; align-items: center; gap: 6px; border: 1px solid transparent; }
+  .mode-badge .dot { width: 7px; height: 7px; border-radius: 50%; }
+  .mode-badge.live { color: var(--good); background: color-mix(in srgb, var(--good) 12%, transparent); border-color: color-mix(in srgb, var(--good) 32%, transparent); }
+  .mode-badge.demo { color: var(--warning); background: color-mix(in srgb, var(--warning) 15%, transparent); border-color: color-mix(in srgb, var(--warning) 38%, transparent); }
+  .mode-badge.info { color: var(--accent); background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 30%, transparent); }
+  .mode-badge.error { color: var(--critical); background: color-mix(in srgb, var(--critical) 12%, transparent); border-color: color-mix(in srgb, var(--critical) 35%, transparent); }
+  .btn { font: inherit; font-size: .82rem; cursor: pointer; border: 1px solid var(--border-strong); background: var(--panel); color: var(--text); padding: 6px 13px; border-radius: 9px; display: inline-flex; align-items: center; gap: 7px; transition: background .12s, border-color .12s; }
+  .btn:hover { background: var(--panel-hover); border-color: var(--accent); }
+  .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* ---------- Banner ---------- */
+  .banner { margin: 14px 0 0; font-size: .84rem; padding: 9px 13px; border-radius: var(--radius-sm); display: none; align-items: center; gap: 9px; }
+  .banner.show { display: flex; }
+  .banner.info { color: var(--accent-ink); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent); }
+  .banner.demo { color: #8a5b00; background: color-mix(in srgb, var(--warning) 16%, transparent); border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent); }
+  :root[data-theme="dark"] .banner.demo, :root:where(:not([data-theme="light"])) .banner.demo { color: var(--warning); }
+  .banner.error { color: var(--critical); background: color-mix(in srgb, var(--critical) 12%, transparent); border: 1px solid color-mix(in srgb, var(--critical) 40%, transparent); }
+  .banner .err-detail { opacity: .72; font-size: .92em; }
+  .spinner { width: 14px; height: 14px; border-radius: 50%; border: 2px solid color-mix(in srgb, var(--accent) 35%, transparent); border-top-color: var(--accent); animation: spin .7s linear infinite; flex: none; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+
+  /* ---------- KPI row ---------- */
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; margin-top: 18px; }
+  .kpi { position: relative; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 15px 17px 15px 19px; box-shadow: var(--shadow-sm); overflow: hidden; }
+  .kpi::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--kc, var(--accent)); }
+  .kpi .label { font-size: .74rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .kpi .value { font-size: 1.9rem; font-weight: 700; line-height: 1.1; margin-top: 5px; }
+  .kpi .value .sub { font-size: 1rem; color: var(--muted); font-weight: 600; }
+  .kpi .foot { font-size: .77rem; color: var(--muted); margin-top: 3px; }
+
+  /* ---------- Cards ---------- */
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; margin-top: 14px; box-shadow: var(--shadow-sm); }
+  .card > header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
+  .card h2 { font-size: 1.02rem; margin: 0; letter-spacing: -.01em; }
+  .card .desc { font-size: .82rem; color: var(--muted); margin: 0 0 12px; max-width: 78ch; }
+  .card .hint { font-size: .76rem; color: var(--faint); }
+  #swimCard:fullscreen { overflow: auto; background: var(--bg); padding: 22px 26px; }
+  #swimCard:-webkit-full-screen { overflow: auto; background: var(--bg); padding: 22px 26px; }
+
+  /* ---------- Controls ---------- */
+  .ctrl-grid { display: grid; grid-template-columns: 1fr; gap: 18px; }
+  .field .lbl { font-size: .74rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+  .field .lbl .count { text-transform: none; letter-spacing: 0; color: var(--faint); font-weight: 400; }
+  .pillrow { display: flex; flex-wrap: wrap; gap: 8px; }
+  .pill { font: inherit; font-size: .84rem; cursor: pointer; border: 1px solid var(--border-strong); background: var(--panel); color: var(--muted); padding: 6px 13px; border-radius: 999px; display: inline-flex; align-items: center; gap: 7px; transition: all .12s; }
+  .pill:hover { border-color: var(--accent); color: var(--text); }
+  .pill[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .pill .tick { width: 14px; height: 14px; }
+  .pill:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .thresh-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  input[type="range"] { -webkit-appearance: none; appearance: none; width: 220px; height: 6px; border-radius: 999px; background: linear-gradient(90deg, var(--accent) var(--fill, 30%), var(--grid) var(--fill, 30%)); outline: none; }
+  input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%; background: var(--panel); border: 3px solid var(--accent); cursor: pointer; box-shadow: var(--shadow-sm); }
+  input[type="range"]::-moz-range-thumb { width: 18px; height: 18px; border-radius: 50%; background: var(--panel); border: 3px solid var(--accent); cursor: pointer; }
+  .readout { font-variant-numeric: tabular-nums; font-weight: 700; font-size: 1.05rem; min-width: 3.4em; }
+  .thresh-caption { font-size: .77rem; color: var(--muted); max-width: 40ch; }
+
+  .picker-tools { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .linkbtn { font: inherit; font-size: .8rem; background: none; border: none; color: var(--accent); cursor: pointer; padding: 2px 4px; border-radius: 5px; }
+  .linkbtn:hover { text-decoration: underline; }
+  .modgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 8px; }
+  .modtoggle { display: flex; align-items: center; gap: 10px; text-align: left; font: inherit; cursor: pointer; border: 1px solid var(--border); background: var(--panel-2); color: var(--text); padding: 9px 12px; border-radius: var(--radius-sm); transition: all .12s; }
+  .modtoggle:hover { border-color: var(--border-strong); background: var(--panel-hover); }
+  .modtoggle[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
+  .modtoggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .modtoggle .box { width: 18px; height: 18px; border-radius: 5px; border: 2px solid var(--border-strong); flex: none; display: flex; align-items: center; justify-content: center; }
+  .modtoggle[aria-pressed="true"] .box { background: var(--accent); border-color: var(--accent); }
+  .modtoggle .box svg { width: 12px; height: 12px; display: none; }
+  .modtoggle[aria-pressed="true"] .box svg { display: block; }
+  .modtoggle .meta { min-width: 0; }
+  .modtoggle .code { font-weight: 650; font-size: .84rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .modtoggle .name { font-size: .76rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .modtoggle .role { font-size: .68rem; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* Weekly-load drill breadcrumb */
+  .load-crumb { display: flex; align-items: center; gap: 7px; font-size: .84rem; margin-bottom: 12px; flex-wrap: wrap; }
+  .load-crumb .lc-step { color: var(--accent); cursor: pointer; }
+  .load-crumb .lc-step.active { color: var(--text); font-weight: 600; cursor: default; }
+  .load-crumb .lc-step:not(.active):hover { text-decoration: underline; }
+  .load-crumb .lc-sep { color: var(--faint); }
+  .load-crumb .lc-hint { margin-left: auto; color: var(--faint); font-size: .76rem; }
+
+  /* Weekly-load exact-dates detail */
+  #loadDetail { display: none; margin-top: 12px; }
+  #loadDetail.show { display: block; }
+  .load-wk { border-top: 1px solid var(--border); padding: 8px 2px; display: grid; grid-template-columns: 150px 1fr; gap: 12px; font-size: .82rem; }
+  .load-wk:first-child { border-top: none; }
+  .load-wk .wk { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .load-wk .wk .sev { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+  .load-wk .items { display: flex; flex-direction: column; gap: 3px; }
+  .load-wk .it { display: flex; gap: 8px; }
+  .load-wk .it .d { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 6.5em; }
+  .load-wk .it .mj { color: var(--serious); font-weight: 600; }
+  .modempty { font-size: .84rem; color: var(--muted); padding: 6px 2px; }
+
+  /* ---------- Charts ---------- */
+  svg.chart { width: 100%; height: auto; display: block; overflow: visible; }
+  .weekline { stroke: var(--grid); stroke-width: 1; }
+  .monthline { stroke: var(--border-strong); stroke-width: 1; }
+  .todayline { stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 3 3; }
+  .axislbl { fill: var(--ink-secondary); font-size: 9.5px; }
+  .monthlbl { fill: var(--ink-primary); font-size: 10px; font-weight: 650; }
+  .todaylbl { fill: var(--accent); font-size: 9px; font-weight: 700; }
+  .cellval { font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .lane-label { fill: var(--ink-primary); font-size: 11.5px; font-weight: 650; }
+  .lane-role { fill: var(--muted); font-size: 9px; }
+  .caret { fill: var(--muted); font-size: 12px; }
+  .lane-count { fill: var(--faint); font-size: 9px; }
+  .item-name { fill: var(--ink-primary); font-size: 10.5px; }
+  .item-sub { fill: var(--muted); font-size: 8.5px; }
+  .earlier { fill: var(--muted); font-size: 13px; font-weight: 700; }
+  .lane-head-hit { cursor: pointer; }
+  .connector { stroke-linecap: round; }
+  .legend { display: flex; gap: 18px; align-items: center; font-size: .78rem; color: var(--ink-secondary); margin-top: 10px; flex-wrap: wrap; }
+  .legend .key { display: inline-flex; align-items: center; gap: 6px; }
+  .legend .swatch { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
+  .legend .swatch.ring { border: 2px solid var(--ink-primary); background: transparent; width: 13px; height: 13px; }
+  .legend .swatch.badge { background: var(--muted); color: var(--panel); font-size: 7px; display: inline-flex; align-items: center; justify-content: center; font-weight: 700; }
+
+  /* ---------- Table ---------- */
+  #tablewrap { overflow-x: auto; border-radius: var(--radius-sm); }
+  table { width: 100%; border-collapse: collapse; font-size: .83rem; }
+  th { text-align: left; color: var(--muted); font-weight: 600; padding: 8px 10px; border-bottom: 1px solid var(--border-strong); white-space: nowrap; cursor: pointer; -webkit-user-select: none; user-select: none; }
+  th:hover { color: var(--text); }
+  td { padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; white-space: nowrap; }
+  tbody tr:hover { background: var(--panel-2); }
+  tr:last-child td { border-bottom: none; }
+  .num { font-variant-numeric: tabular-nums; text-align: right; }
+  .typebadge { display: inline-flex; align-items: center; gap: 6px; font-size: .78rem; }
+  .typebadge .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .chip { display: inline-flex; align-items: center; gap: 4px; font-size: .72rem; padding: 2px 8px; border-radius: 999px; border: 1px solid transparent; }
+  .chip.major { background: color-mix(in srgb, var(--serious) 16%, transparent); color: var(--serious); border-color: color-mix(in srgb, var(--serious) 45%, transparent); }
+  .chip.sa { background: var(--accent-soft); color: var(--accent-ink); border-color: color-mix(in srgb, var(--accent) 35%, transparent); }
+  .empty { color: var(--muted); font-size: .85rem; padding: 20px 2px; text-align: center; }
+
+  #viztip { position: fixed; z-index: 40; pointer-events: none; background: #0b0f14; color: #fff; padding: 7px 11px; border-radius: 8px; font-size: .78rem; line-height: 1.55; white-space: nowrap; opacity: 0; transition: opacity .08s; box-shadow: 0 6px 20px rgba(0,0,0,.32); }
+  #viztip b { font-weight: 700; }
+  #viztip .t-sub { color: #b9c2cf; }
+</style>
+</head>
+<body>
+  <div class="appbar">
+    <div class="appbar-inner">
+      <div class="brand">
+        <svg class="glyph" viewBox="0 0 40 40" aria-hidden="true">
+          <circle class="ring" cx="20" cy="20" r="17"/>
+          <circle class="ring" cx="20" cy="20" r="11"/>
+          <circle class="ring" cx="20" cy="20" r="5"/>
+          <line class="grid-l" x1="20" y1="3" x2="20" y2="37"/>
+          <line class="grid-l" x1="3" y1="20" x2="37" y2="20"/>
+          <g class="sweep-rot"><line class="sweep" x1="20" y1="20" x2="34" y2="9"/></g>
+          <circle class="blip" cx="29" cy="12" r="2.4"/>
+        </svg>
+        <div>
+          <h1>Deadline Radar</h1>
+          <div class="tagline">Cross-module assessment pressure</div>
+        </div>
+      </div>
+      <div class="appbar-right">
+        <span class="mode-badge info" id="modeBadge"><span class="dot" style="background:currentColor"></span>Starting…</span>
+        <button class="btn" id="refreshBtn" type="button" title="Reload from Brightspace">↻ Refresh</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <div class="banner" id="banner"></div>
+
+    <div class="kpis" id="kpis"></div>
+
+    <div class="card">
+      <header><h2>Scope</h2><span class="hint">Your selection is remembered on this browser.</span></header>
+      <div class="ctrl-grid">
+        <div class="field">
+          <div class="lbl">Show modules where I'm <span class="count" id="roleCount"></span></div>
+          <div class="pillrow" id="roleFilter"></div>
+        </div>
+        <div class="field" id="semesterField">
+          <div class="lbl">Semester <span class="count" id="semCount"></span></div>
+          <div class="pillrow" id="semesterFilter"></div>
+        </div>
+        <div class="field">
+          <div class="lbl">Major-item threshold — share of the module grade</div>
+          <div class="thresh-row">
+            <input type="range" id="threshRange" min="0" max="50" step="1" value="15" aria-label="Major item threshold percent">
+            <span class="readout" id="threshReadout">15%</span>
+            <span class="thresh-caption">Items at or above this weight drive the pressure view and get the ring marker. Lower it to catch more, raise it to focus on the heaviest.</span>
+          </div>
+        </div>
+        <div class="field">
+          <div class="lbl">My program <span class="count" id="modCount"></span></div>
+          <div class="picker-tools">
+            <button class="linkbtn" id="selAll" type="button">Select all</button>
+            <span class="hint">·</span>
+            <button class="linkbtn" id="selNone" type="button">Clear</button>
+          </div>
+          <div class="modgrid" id="modgrid"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <header>
+        <h2>Assessment pressure — major items only</h2>
+        <button class="btn" id="loadExpand" type="button">＋ Exact dates</button>
+      </header>
+      <p class="desc">Drill down: months → weeks → days. Each cell is shaded by how much major assessment lands in it — click to zoom in, use the breadcrumb to zoom back out. Expand for a flat list of exact item dates.</p>
+      <div id="loadStrip"></div>
+      <div id="loadDetail"></div>
+    </div>
+
+    <div class="card" id="swimCard">
+      <header><h2>Assignment &amp; quiz windows by module</h2><button class="btn" id="swimFull" type="button">⛶ Full screen</button></header>
+      <p class="desc">One row per assignment or quiz, grouped by module — click a module to collapse it. The timeline runs from today to the last due date; markers span open → due, sized by weight. Ringed markers are major items (≥ threshold). Special-access extensions appear in teal after the due date.</p>
+      <div id="swimlane"></div>
+      <div class="legend" id="legend"></div>
+    </div>
+
+    <div class="card">
+      <header><h2>All items in scope</h2><span class="hint">Click a heading to sort</span></header>
+      <div id="tablewrap"></div>
+    </div>
+  </div>
+
+  <div id="viztip"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  // ============================================================= state
+  let MODE = 'init';                 // 'live' | 'demo'
+  let D = { modules: [] };           // modules: [{id, code, name, role, on}]
+  let itemsByMod = {};               // id -> [{mod,type,name,opensAt,dueAt,weightPct,saCount,id}]
+  let selectedRoles = new Set();
+  let selectedSemesters = new Set();
+  let threshold = 15;
+  let collapsed = new Set();          // module ids collapsed in the timeline (start expanded)
+  let loadExpanded = false;           // weekly-load "exact dates" panel open?
+  let loadLevel = 'month';            // load strip drill level: 'month' | 'week' | 'day'
+  let loadMonthKey = null;            // 'YYYY-MM' being drilled into
+  let loadWeekStart = null;           // ISO Monday of the week being drilled into
+
+  const LS = {
+    sel: 'deadlineRadar.selected',
+    roles: 'deadlineRadar.roles',
+    semesters: 'deadlineRadar.semesters',
+    thresh: 'deadlineRadar.threshold'
+  };
+  function loadPrefs() {
+    try { const t = parseInt(localStorage.getItem(LS.thresh), 10); if (!isNaN(t)) threshold = t; } catch (e) {}
+  }
+  function savedIds() { try { return new Set(JSON.parse(localStorage.getItem(LS.sel) || '[]').map(String)); } catch (e) { return new Set(); } }
+  function saveSelection() { try { localStorage.setItem(LS.sel, JSON.stringify(D.modules.filter(m => m.on).map(m => String(m.id)))); } catch (e) {} }
+  function savedRoles() { try { const r = JSON.parse(localStorage.getItem(LS.roles) || 'null'); return r ? new Set(r) : null; } catch (e) { return null; } }
+  function saveRoles() { try { localStorage.setItem(LS.roles, JSON.stringify([...selectedRoles])); } catch (e) {} }
+  function savedSemesters() { try { const r = JSON.parse(localStorage.getItem(LS.semesters) || 'null'); return r ? new Set(r) : null; } catch (e) { return null; } }
+  function saveSemesters() { try { localStorage.setItem(LS.semesters, JSON.stringify([...selectedSemesters])); } catch (e) {} }
+  function saveThresh() { try { localStorage.setItem(LS.thresh, String(threshold)); } catch (e) {} }
+
+  // ============================================================= API
+  const API = {
+    origin: location.origin,
+    lp: null, le: null,
+    async get(path) {
+      const url = /^https?:/i.test(path) ? path : this.origin + path;
+      const r = await fetch(url, { credentials: 'include', headers: { Accept: 'application/json' } });
+      if (!r.ok) throw new Error(path + ' → HTTP ' + r.status);
+      return r.json();
+    },
+    async versions() {
+      const arr = await this.get('/d2l/api/versions/');
+      const pick = code => { const p = (arr || []).find(x => x.ProductCode === code); return p ? p.LatestVersion : null; };
+      this.lp = pick('lp'); this.le = pick('le');
+      if (!this.lp || !this.le) throw new Error('No LP/LE version advertised');
+    }
+  };
+
+  // paged PagedResultSet (enrollments): {Items, PagingInfo:{Bookmark,HasMoreItems}}
+  async function fetchEnrollments() {
+    let out = [], bookmark = '', guard = 0;
+    do {
+      const q = '?isActive=true' + (bookmark ? '&bookmark=' + encodeURIComponent(bookmark) : '');
+      const page = await API.get('/d2l/api/lp/' + API.lp + '/enrollments/myenrollments/' + q);
+      (page.Items || []).forEach(x => out.push(x));
+      const more = page.PagingInfo && page.PagingInfo.HasMoreItems;
+      bookmark = more ? page.PagingInfo.Bookmark : '';
+    } while (bookmark && ++guard < 60);
+    return out;
+  }
+
+  // ObjectListPage (quizzes): {Objects, Next}
+  async function fetchObjectList(path) {
+    let out = [], next = path, guard = 0;
+    while (next && guard++ < 60) {
+      const page = await API.get(next);
+      if (Array.isArray(page)) { out = out.concat(page); break; }
+      out = out.concat(page.Objects || []);
+      next = page.Next || null;
+    }
+    return out;
+  }
+  // From a special-access response: how many entries, and the latest overridden
+  // date (due/end). Field shapes differ between quizzes and dropbox, so probe.
+  function saDates(x) {
+    const list = Array.isArray(x) ? x : (x && x.Objects) || [];
+    let count = 0, maxDate = null;
+    for (const e of list) {
+      count++;
+      const src = e.SpecialAccess || e.AccessRestrictions || e;
+      const d = src.DueDate || src.EndDate || src.StartDate || e.DueDate || e.EndDate || null;
+      const iso = d ? isoLocal(d) : null;
+      if (iso && (!maxDate || iso > maxDate)) maxDate = iso;
+    }
+    return { count: count, maxDate: maxDate };
+  }
+
+  const COURSE_OFFERING_TYPE = 3;
+  function isCourseOffering(e) {
+    const t = e.OrgUnit && e.OrgUnit.Type;
+    return t && (t.Id === COURSE_OFFERING_TYPE || /course offering/i.test(t.Name || t.Code || ''));
+  }
+  function toModule(e, sel) {
+    const ou = e.OrgUnit;
+    return { id: ou.Id, code: ou.Code || String(ou.Id), name: ou.Name || ou.Code || String(ou.Id),
+             role: (e.Access && e.Access.ClasslistRoleName) || 'Unknown', semester: null, on: sel.has(String(ou.Id)) };
+  }
+
+  const SEMESTER_TYPE = 5;
+  // Course offerings don't carry their semester, so look it up from the org parents.
+  async function attachSemesters(mods) {
+    await Promise.all(mods.map(async m => {
+      try {
+        const parents = await API.get('/d2l/api/lp/' + API.lp + '/orgstructure/' + m.id + '/parents/');
+        const sem = (parents || []).find(p => p && p.Type && (p.Type.Id === SEMESTER_TYPE || /semester/i.test((p.Type.Code || '') + ' ' + (p.Type.Name || ''))));
+        if (sem) m.semester = sem.Name || sem.Code || null;
+      } catch (e) {}
+    }));
+  }
+
+  // Grade weights for a module. Weighted scheme → item Weight; else MaxPoints share.
+  function buildWeightMap(grades) {
+    const arr = Array.isArray(grades) ? grades : (grades && grades.Objects) || [];
+    const map = {};
+    const anyWeight = arr.some(g => (g.Weight || 0) > 0);
+    if (anyWeight) {
+      arr.forEach(g => { if (g.Id != null) map[g.Id] = Math.round(g.Weight || 0); });
+    } else {
+      const total = arr.reduce((s, g) => s + (g.MaxPoints || 0), 0) || 1;
+      arr.forEach(g => { if (g.Id != null) map[g.Id] = Math.round((g.MaxPoints || 0) / total * 100); });
+    }
+    return map;
+  }
+  function weightOf(map, gradeItemId) { return gradeItemId != null && map[gradeItemId] != null ? map[gradeItemId] : 0; }
+
+  function isoLocal(s) {
+    if (!s) return null;
+    const d = new Date(s); if (isNaN(d)) return null;
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  }
+
+  // Fetch all assignments + quizzes for one module, mapped to item shape.
+  async function fetchModuleItems(mod) {
+    const ou = mod.id, out = [];
+    let weightMap = {};
+    try { weightMap = buildWeightMap(await API.get('/d2l/api/le/' + API.le + '/' + ou + '/grades/')); } catch (e) {}
+
+    // Assignments
+    try {
+      const folders = await API.get('/d2l/api/le/' + API.le + '/' + ou + '/dropbox/folders/');
+      await Promise.all((folders || []).map(async f => {
+        const av = f.Availability || {};
+        const due = f.DueDate || av.EndDate || av.StartDate;
+        if (!due) return;
+        let sa = { count: 0, maxDate: null };
+        try { sa = saDates(await API.get('/d2l/api/le/' + API.le + '/' + ou + '/dropbox/folders/' + f.Id + '/specialaccess/')); } catch (e) {}
+        out.push({ mod: ou, type: 'assignment', id: f.Id, name: f.Name || 'Untitled assignment',
+                   opensAt: isoLocal(av.StartDate || due), dueAt: isoLocal(due),
+                   weightPct: weightOf(weightMap, f.GradeItemId), saCount: sa.count, saMax: sa.maxDate });
+      }));
+    } catch (e) {}
+
+    // Quizzes
+    try {
+      const quizzes = await fetchObjectList('/d2l/api/le/' + API.le + '/' + ou + '/quizzes/');
+      await Promise.all((quizzes || []).map(async q => {
+        const due = q.DueDate || q.EndDate || q.StartDate;
+        if (!due) return;
+        let sa = { count: 0, maxDate: null };
+        try { sa = saDates(await API.get('/d2l/api/le/' + API.le + '/' + ou + '/quizzes/' + q.Id + '/specialaccess/')); } catch (e) {}
+        out.push({ mod: ou, type: 'quiz', id: q.Id, name: q.Name || 'Untitled quiz',
+                   opensAt: isoLocal(q.StartDate || due), dueAt: isoLocal(due),
+                   weightPct: weightOf(weightMap, q.GradeItemId), saCount: sa.count, saMax: sa.maxDate });
+      }));
+    } catch (e) {}
+
+    return out.filter(it => it.dueAt);
+  }
+
+  async function ensureLoaded(mod) {
+    if (itemsByMod[mod.id]) return;
+    itemsByMod[mod.id] = await fetchModuleItems(mod);
+  }
+
+  // ============================================================= helpers
+  const $ = id => document.getElementById(id);
+  function toDate(s) { return new Date(s + 'T00:00:00'); }
+  function fmtShort(d) { return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' }); }
+  function mondayOf(d) { const x = new Date(d); const day = (x.getDay() + 6) % 7; x.setDate(x.getDate() - day); return x; }
+  function addDays(d, n) { const x = new Date(d); x.setDate(x.getDate() + n); return x; }
+  function fmtFull(d) { return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }); }
+  function startOfToday() { const t = new Date(); t.setHours(0, 0, 0, 0); return t; }
+  // Timeline runs from the start of THIS week to one week after the last due date.
+  function timeDomain(items) {
+    const start = mondayOf(startOfToday());
+    let end;
+    if (items.length) {
+      const dates = [];
+      items.forEach(it => { dates.push(toDate(it.dueAt)); if (it.saMax) dates.push(toDate(it.saMax)); });
+      end = mondayOf(addDays(new Date(Math.max.apply(null, dates)), 7));
+    } else end = addDays(start, 56);
+    if (end <= addDays(start, 7)) end = addDays(start, 56);   // guarantee a sensible span
+    return { start, end };
+  }
+  function escapeHtml(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
+  const SVGNS = 'http://www.w3.org/2000/svg';
+  function el(tag, attrs, text) { const n = document.createElementNS(SVGNS, tag); for (const k in attrs) n.setAttribute(k, attrs[k]); if (text != null) n.textContent = text; return n; }
+
+  const tip = $('viztip');
+  function showTip(e, html) { tip.innerHTML = html; moveTip(e); tip.style.opacity = 1; }
+  function moveTip(e) { tip.style.left = (e.clientX + 14) + 'px'; tip.style.top = (e.clientY + 14) + 'px'; }
+  function hideTip() { tip.style.opacity = 0; }
+
+  function setBadge(kind, text) {
+    const b = $('modeBadge'); b.className = 'mode-badge ' + kind;
+    b.innerHTML = '<span class="dot" style="background:currentColor"></span>' + text;
+  }
+  function banner(kind, html) {
+    const b = $('banner');
+    if (!kind) { b.className = 'banner'; b.innerHTML = ''; return; }
+    b.className = 'banner show ' + kind; b.innerHTML = html;
+  }
+
+  // ============================================================= scope
+  function distinctRoles() { return [...new Set(D.modules.map(m => m.role))].sort(); }
+  function semOf(m) { return m.semester || 'No semester'; }
+  function distinctSemesters() { return [...new Set(D.modules.map(semOf))].sort(); }
+  function inScopeModules() { return D.modules.filter(m => m.on && selectedRoles.has(m.role) && selectedSemesters.has(semOf(m))); }
+  function inScopeItems() { const out = []; inScopeModules().forEach(m => { (itemsByMod[m.id] || []).forEach(it => out.push(it)); }); return out; }
+
+  // ============================================================= weekly model
+  function weeklyLoad(items) {
+    const { start, end } = timeDomain(items);
+    const weeks = [];
+    for (let d = new Date(start); d < end; d = addDays(d, 7)) {
+      const wkStart = new Date(d), wkEnd = addDays(d, 7);
+      const inWeek = items.filter(it => { const due = toDate(it.dueAt); return due >= wkStart && due < wkEnd; });
+      const majors = inWeek.filter(it => it.weightPct >= threshold);
+      const majorWeight = majors.reduce((s, it) => s + it.weightPct, 0);
+      let status = 'good';
+      if (majors.length >= 3 || majorWeight >= 35) status = 'critical';
+      else if (majors.length >= 2 || majorWeight >= 20) status = 'warning';
+      else if (inWeek.length > 0) status = 'quiet';
+      weeks.push({ start: wkStart, end: wkEnd, items: inWeek, majors, majorWeight, status });
+    }
+    return weeks;
+  }
+
+  // ============================================================= render: KPIs
+  const STATUS_VAR = { good: 'var(--good)', warning: 'var(--warning)', serious: 'var(--serious)', critical: 'var(--critical)' };
+  function renderKpis() {
+    const mods = inScopeModules(), items = inScopeItems();
+    const majors = items.filter(it => it.weightPct >= threshold);
+    const saTotal = items.reduce((s, it) => s + it.saCount, 0);
+    const weeks = weeklyLoad(items);
+    const weeksWithItems = weeks.filter(w => w.items.length).length;
+    const flagged = weeks.filter(w => w.status === 'warning' || w.status === 'critical').length;
+    const tiles = [
+      { c: 'good', label: 'Modules in scope', value: mods.length, foot: mods.length ? 'across your selected roles' : 'select modules below' },
+      { c: 'serious', label: 'Major items', value: majors.length, sub: ' / ' + items.length, foot: '≥ ' + threshold + '% of a module grade' },
+      { c: flagged ? 'critical' : 'good', label: 'High-pressure weeks', value: flagged, foot: 'of ' + weeksWithItems + ' weeks with assessment ahead' },
+      { c: 'accent', label: 'Special-access changes', value: saTotal, foot: 'modified dates across items in scope' }
+    ];
+    const host = $('kpis'); host.innerHTML = '';
+    for (const t of tiles) {
+      const div = document.createElement('div'); div.className = 'kpi';
+      div.style.setProperty('--kc', t.c === 'accent' ? 'var(--accent)' : STATUS_VAR[t.c]);
+      div.innerHTML = '<div class="label">' + t.label + '</div>' +
+        '<div class="value">' + t.value + (t.sub ? '<span class="sub">' + t.sub + '</span>' : '') + '</div>' +
+        '<div class="foot">' + t.foot + '</div>';
+      host.appendChild(div);
+    }
+  }
+
+  // ============================================================= render: controls
+  const TICK = '<svg viewBox="0 0 16 16" class="tick" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5l3.2 3.2L13 5"/></svg>';
+  function renderRoleFilter() {
+    const host = $('roleFilter'); host.innerHTML = '';
+    const roles = distinctRoles();
+    roles.forEach(r => {
+      const on = selectedRoles.has(r);
+      const b = document.createElement('button'); b.className = 'pill'; b.type = 'button';
+      b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      b.innerHTML = (on ? TICK : '') + escapeHtml(r);
+      b.addEventListener('click', () => {
+        if (selectedRoles.has(r)) { if (selectedRoles.size > 1) selectedRoles.delete(r); }
+        else selectedRoles.add(r);
+        saveRoles(); renderRoleFilter(); renderModPicker(); renderAll();
+      });
+      host.appendChild(b);
+    });
+    $('roleCount').textContent = '(' + selectedRoles.size + ' of ' + roles.length + ')';
+  }
+
+  function renderSemesterFilter() {
+    const host = $('semesterFilter'); if (!host) return;
+    host.innerHTML = '';
+    const sems = distinctSemesters();
+    const field = $('semesterField');
+    if (field) field.style.display = (sems.length <= 1 && sems[0] === 'No semester') ? 'none' : '';
+    sems.forEach(s => {
+      const on = selectedSemesters.has(s);
+      const b = document.createElement('button'); b.className = 'pill'; b.type = 'button';
+      b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      b.innerHTML = (on ? TICK : '') + escapeHtml(s);
+      b.addEventListener('click', () => {
+        if (selectedSemesters.has(s)) { if (selectedSemesters.size > 1) selectedSemesters.delete(s); }
+        else selectedSemesters.add(s);
+        saveSemesters(); renderSemesterFilter(); renderModPicker(); renderAll();
+      });
+      host.appendChild(b);
+    });
+    $('semCount').textContent = '(' + selectedSemesters.size + ' of ' + sems.length + ')';
+  }
+
+  function renderModPicker() {
+    const host = $('modgrid'); host.innerHTML = '';
+    const visible = D.modules.filter(m => selectedRoles.has(m.role) && selectedSemesters.has(semOf(m)));
+    if (!visible.length) { host.innerHTML = '<div class="modempty">No modules for the selected filters.</div>'; $('modCount').textContent = ''; return; }
+    visible.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+    visible.forEach(m => {
+      const b = document.createElement('button'); b.className = 'modtoggle'; b.type = 'button';
+      b.setAttribute('aria-pressed', m.on ? 'true' : 'false');
+      b.innerHTML = '<span class="box">' + TICK + '</span>' +
+        '<span class="meta"><div class="code" title="' + escapeHtml(m.name) + '">' + escapeHtml(m.name) + '</div>' +
+        '<div class="name">' + escapeHtml(m.code) + '</div>' +
+        '<div class="role">' + escapeHtml(m.role) + (m.semester ? ' · ' + escapeHtml(m.semester) : '') + '</div></span>';
+      b.addEventListener('click', () => toggleModule(m));
+      host.appendChild(b);
+    });
+    const onCount = visible.filter(m => m.on).length;
+    $('modCount').textContent = '(' + onCount + ' of ' + visible.length + ' selected)';
+  }
+
+  async function toggleModule(m) {
+    m.on = !m.on; saveSelection(); renderModPicker();
+    if (MODE === 'live' && m.on && !itemsByMod[m.id]) {
+      banner('info', '<span class="spinner"></span> Loading ' + escapeHtml(m.name) + '…');
+      try { await ensureLoaded(m); } catch (e) { itemsByMod[m.id] = []; }
+      banner(null);
+    }
+    renderAll();
+  }
+  async function setAll(on) {
+    const visible = D.modules.filter(m => selectedRoles.has(m.role));
+    visible.forEach(m => { m.on = on; }); saveSelection(); renderModPicker();
+    if (MODE === 'live' && on) {
+      const need = visible.filter(m => !itemsByMod[m.id]);
+      for (let i = 0; i < need.length; i++) {
+        banner('info', '<span class="spinner"></span> Loading ' + escapeHtml(need[i].name) + ' (' + (i + 1) + '/' + need.length + ')…');
+        try { await ensureLoaded(need[i]); } catch (e) { itemsByMod[need[i].id] = []; }
+      }
+      banner(null);
+    }
+    renderAll();
+  }
+
+  function setThreshFill() { const pct = (threshold / 50) * 100; $('threshRange').style.setProperty('--fill', pct + '%'); }
+  $('threshRange').addEventListener('input', e => {
+    threshold = parseInt(e.target.value, 10); $('threshReadout').textContent = threshold + '%';
+    setThreshFill(); saveThresh(); renderAll();
+  });
+  $('selAll').addEventListener('click', () => setAll(true));
+  $('selNone').addEventListener('click', () => setAll(false));
+  $('refreshBtn').addEventListener('click', () => init(true));
+
+  // Full-screen the timeline card (and move the tooltip inside it so hovers still work).
+  $('swimFull').addEventListener('click', () => {
+    const card = $('swimCard');
+    if (!document.fullscreenElement) { (card.requestFullscreen || card.webkitRequestFullscreen || function () {}).call(card); }
+    else { (document.exitFullscreen || document.webkitExitFullscreen || function () {}).call(document); }
+  });
+  document.addEventListener('fullscreenchange', () => {
+    const fs = document.fullscreenElement;
+    $('swimFull').textContent = fs ? '⤢ Exit full screen' : '⛶ Full screen';
+    (fs || document.body).appendChild($('viztip'));
+  });
+
+  $('loadExpand').addEventListener('click', () => {
+    loadExpanded = !loadExpanded;
+    $('loadExpand').textContent = loadExpanded ? '－ Hide dates' : '＋ Exact dates';
+    renderLoadDetail();
+  });
+
+  // ============================================================= render: load strip (month → week → day drill)
+  const SEV_RANK = { good: 0, quiet: 1, warning: 2, critical: 3 };
+  function worseOf(a, b) { return (SEV_RANK[a] || 0) >= (SEV_RANK[b] || 0) ? a : b; }
+  function monthKeyOf(d) { return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0'); }
+  const LOAD_FILL = { good: 'var(--ord-1)', quiet: 'var(--ord-2)', warning: 'var(--warning)', critical: 'var(--critical)' };
+
+  function renderLoadStrip() {
+    const host = $('loadStrip'); host.innerHTML = '';
+    const items = inScopeItems();
+    if (!items.length) { host.innerHTML = '<div class="empty">No dated items in scope yet.</div>'; return; }
+    const weeks = weeklyLoad(items);
+    const now = new Date();
+
+    // group weeks into months
+    const monthsMap = new Map();
+    weeks.forEach(w => {
+      const key = monthKeyOf(w.start);
+      let mo = monthsMap.get(key);
+      if (!mo) { mo = { key, date: new Date(w.start.getFullYear(), w.start.getMonth(), 1), weeks: [], status: 'good', items: 0, majors: 0 }; monthsMap.set(key, mo); }
+      mo.weeks.push(w); mo.items += w.items.length; mo.majors += w.majors.length; mo.status = worseOf(mo.status, w.status);
+    });
+    const months = [...monthsMap.values()];
+
+    // keep the drill state valid if the scope changed underneath it
+    if (loadLevel === 'week' && !monthsMap.has(loadMonthKey)) { loadLevel = 'month'; loadMonthKey = null; }
+    if (loadLevel === 'day' && !weeks.some(w => isoLocal(w.start) === loadWeekStart)) { loadLevel = monthsMap.has(loadMonthKey) ? 'week' : 'month'; loadWeekStart = null; }
+
+    // breadcrumb
+    const crumb = document.createElement('div'); crumb.className = 'load-crumb';
+    const step = (label, active, fn) => { const s = document.createElement('span'); s.className = 'lc-step' + (active ? ' active' : ''); s.textContent = label; if (fn) s.addEventListener('click', fn); crumb.appendChild(s); };
+    const sep = () => { const s = document.createElement('span'); s.className = 'lc-sep'; s.textContent = '›'; crumb.appendChild(s); };
+    step('Months', loadLevel === 'month', loadLevel === 'month' ? null : () => { loadLevel = 'month'; loadMonthKey = null; loadWeekStart = null; renderLoadStrip(); });
+    if (loadLevel !== 'month') {
+      const mo = monthsMap.get(loadMonthKey) || months[0];
+      sep(); step(mo.date.toLocaleDateString('en-GB', { month: 'short', year: 'numeric' }), loadLevel === 'week', loadLevel === 'week' ? null : () => { loadLevel = 'week'; loadWeekStart = null; renderLoadStrip(); });
+      if (loadLevel === 'day') { const wk = weeks.find(w => isoLocal(w.start) === loadWeekStart); sep(); step('w/c ' + fmtShort(wk.start), true, null); }
+    }
+    const hint = document.createElement('span'); hint.className = 'lc-hint';
+    hint.textContent = loadLevel === 'month' ? 'click a month to see its weeks' : loadLevel === 'week' ? 'click a week to see its days' : 'days in this week';
+    crumb.appendChild(hint);
+    host.appendChild(crumb);
+
+    // build cells for the current level
+    let cells = [];
+    if (loadLevel === 'month') {
+      cells = months.map(mo => ({
+        status: mo.status, num: mo.majors, isNow: monthKeyOf(now) === mo.key,
+        label: mo.date.toLocaleDateString('en-GB', { month: 'short', year: 'numeric' }),
+        tip: '<b>' + mo.date.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' }) + '</b><br><span class="t-sub">' + mo.items + ' due · ' + mo.majors + ' major · ' + mo.weeks.length + ' weeks</span>',
+        onClick: () => { loadLevel = 'week'; loadMonthKey = mo.key; renderLoadStrip(); }
+      }));
+    } else if (loadLevel === 'week') {
+      const mo = monthsMap.get(loadMonthKey) || months[0];
+      cells = mo.weeks.map(w => ({
+        status: w.status, num: w.majors.length, isNow: now >= w.start && now < w.end,
+        label: 'w/c ' + fmtShort(w.start),
+        tip: '<b>Week of ' + fmtFull(w.start) + '</b><br><span class="t-sub">' + w.items.length + ' due · ' + w.majors.length + ' major · ' + w.majorWeight + '% combined</span>',
+        onClick: () => { loadLevel = 'day'; loadWeekStart = isoLocal(w.start); renderLoadStrip(); }
+      }));
+    } else {
+      const wk = weeks.find(w => isoLocal(w.start) === loadWeekStart);
+      for (let i = 0; i < 7; i++) {
+        const day = addDays(wk.start, i), dk = isoLocal(day);
+        const dItems = wk.items.filter(it => it.dueAt === dk);
+        const dMaj = dItems.filter(it => it.weightPct >= threshold);
+        const dW = dMaj.reduce((s, it) => s + it.weightPct, 0);
+        let status = 'good';
+        if (dMaj.length >= 2 || dW >= 35) status = 'critical'; else if (dMaj.length >= 1 || dW >= 20) status = 'warning'; else if (dItems.length) status = 'quiet';
+        const tipItems = dItems.length ? dItems.map(it => '• ' + escapeHtml(it.name) + ' (' + it.weightPct + '%)').join('<br>') : 'nothing due';
+        cells.push({ status, num: dMaj.length, isNow: isoLocal(now) === dk,
+          label: day.toLocaleDateString('en-GB', { weekday: 'short' }) + ' ' + day.getDate(),
+          tip: '<b>' + fmtFull(day) + '</b><br><span class="t-sub">' + tipItems + '</span>', onClick: null });
+      }
+    }
+
+    // draw the cells
+    const n = cells.length, padL = 2, padR = 2, padT = 4, cellGap = 5, cellH = 50;
+    const W = 1100, iW = W - padL - padR, cellW = (iW - cellGap * (n - 1)) / n;
+    const H = padT + cellH + 20;
+    const svg = el('svg', { viewBox: '0 0 ' + W + ' ' + H, class: 'chart', role: 'img' });
+    cells.forEach((c, i) => {
+      const x = padL + i * (cellW + cellGap);
+      const rect = el('rect', { x: x.toFixed(1), y: padT, width: cellW.toFixed(1), height: cellH, rx: 8, fill: LOAD_FILL[c.status] });
+      if (c.onClick) rect.style.cursor = 'pointer';
+      rect.addEventListener('mouseenter', e => showTip(e, c.tip));
+      rect.addEventListener('mousemove', moveTip); rect.addEventListener('mouseleave', hideTip);
+      if (c.onClick) rect.addEventListener('click', c.onClick);
+      svg.appendChild(rect);
+      if (c.isNow) svg.appendChild(el('rect', { x: (x + 1).toFixed(1), y: padT + 1, width: (cellW - 2).toFixed(1), height: cellH - 2, rx: 7, fill: 'none', stroke: 'var(--accent)', 'stroke-width': 2, 'pointer-events': 'none' }));
+      if (c.num) {
+        const light = c.status === 'critical' || c.status === 'warning';
+        svg.appendChild(el('text', { x: (x + cellW / 2).toFixed(1), y: (padT + cellH / 2 + 4.5).toFixed(1), 'text-anchor': 'middle', class: 'cellval', fill: light ? '#fff' : 'var(--ink-primary)', 'pointer-events': 'none' }, c.num));
+      }
+      svg.appendChild(el('text', { x: (x + cellW / 2).toFixed(1), y: (padT + cellH + 14).toFixed(1), 'text-anchor': 'middle', class: c.isNow ? 'todaylbl' : 'axislbl', 'pointer-events': 'none' }, c.label));
+    });
+    host.appendChild(svg);
+
+    const lg = document.createElement('div'); lg.className = 'legend';
+    lg.innerHTML =
+      '<span class="key"><span class="swatch" style="background:var(--ord-1)"></span>quiet</span>' +
+      '<span class="key"><span class="swatch" style="background:var(--ord-2)"></span>busy</span>' +
+      '<span class="key"><span class="swatch" style="background:var(--warning)"></span>2+ major</span>' +
+      '<span class="key"><span class="swatch" style="background:var(--critical)"></span>3+ major, or ≥35% combined</span>';
+    host.appendChild(lg);
+  }
+
+  // Exact-dates breakdown under the weekly load strip (toggled open).
+  const SEV_VAR = { good: 'var(--ord-2)', quiet: 'var(--ord-2)', warning: 'var(--warning)', critical: 'var(--critical)' };
+  function renderLoadDetail() {
+    const host = $('loadDetail'); if (!host) return;
+    host.classList.toggle('show', loadExpanded);
+    if (!loadExpanded) { host.innerHTML = ''; return; }
+    const items = inScopeItems();
+    const weeks = weeklyLoad(items).filter(w => w.items.length);
+    if (!weeks.length) { host.innerHTML = '<div class="empty">No dated items in scope.</div>'; return; }
+    const modName = new Map(D.modules.map(m => [m.id, m.name]));
+    host.innerHTML = weeks.map(w => {
+      const its = w.items.slice().sort((a, b) => a.dueAt < b.dueAt ? -1 : a.dueAt > b.dueAt ? 1 : 0);
+      const rows = its.map(it => '<div class="it"><span class="d">' + fmtShort(toDate(it.dueAt)) + '</span><span>' +
+        escapeHtml(modName.get(it.mod)) + ' — ' + escapeHtml(it.name) +
+        (it.weightPct >= threshold ? ' <span class="mj">' + it.weightPct + '% major</span>' : ' <span class="d">' + it.weightPct + '%</span>') + '</span></div>').join('');
+      return '<div class="load-wk"><div class="wk"><span class="sev" style="background:' + (SEV_VAR[w.status] || 'var(--ord-2)') + '"></span>w/c ' + fmtFull(w.start) + '</div><div class="items">' + rows + '</div></div>';
+    }).join('');
+  }
+
+  // ============================================================= render: swimlane
+  function renderSwimlane() {
+    const host = $('swimlane'); host.innerHTML = '';
+    const mods = inScopeModules(), items = inScopeItems();
+    if (!mods.length) { host.innerHTML = '<div class="empty">Select one or more modules to see their timeline.</div>'; $('legend').innerHTML = ''; return; }
+
+    const gutter = 210, padR = 22, padT = 48, headerH = 30, itemH = 30, collapsedH = 46;
+    const W = 1100, iW = W - gutter - padR;
+    const { start, end } = timeDomain(items);
+    const totalMs = (end - start) || 1;
+    const xOf = d => gutter + iW * (d - start) / totalMs;
+    const cx = d => xOf(d < start ? start : (d > end ? end : d));    // clamp into the window
+
+    // ---- lay out rows: a header per module, then one row per item unless collapsed ----
+    const layout = []; let yCur = padT;
+    mods.forEach(m => {
+      const its = (itemsByMod[m.id] || []).slice().sort((a, b) => a.dueAt < b.dueAt ? -1 : a.dueAt > b.dueAt ? 1 : 0);
+      const isCol = collapsed.has(String(m.id));
+      layout.push({ kind: 'header', mod: m, items: its, y: yCur, h: isCol ? collapsedH : headerH, collapsed: isCol });
+      yCur += isCol ? collapsedH : headerH;
+      if (!isCol) its.forEach(it => { layout.push({ kind: 'item', mod: m, item: it, y: yCur, h: itemH }); yCur += itemH; });
+    });
+    const H = yCur + 8;
+    const svg = el('svg', { viewBox: '0 0 ' + W + ' ' + H, class: 'chart', role: 'img' });
+
+    // ---- gridlines, with months on an upper row and the week's date below ----
+    let lastYear = null;
+    for (let d = new Date(start); d <= end; d = addDays(d, 7)) {
+      const x = xOf(d), firstOfMonth = d.getDate() <= 7;
+      svg.appendChild(el('line', { x1: x.toFixed(1), y1: padT - 13, x2: x.toFixed(1), y2: H - 4, class: firstOfMonth ? 'monthline' : 'weekline' }));
+      if (d < end) svg.appendChild(el('text', { x: x.toFixed(1), y: padT - 17, 'text-anchor': 'middle', class: 'axislbl' }, String(d.getDate())));
+      if (firstOfMonth) {
+        const showYear = d.getFullYear() !== lastYear; lastYear = d.getFullYear();
+        svg.appendChild(el('text', { x: (x + 3).toFixed(1), y: padT - 32, class: 'monthlbl' }, d.toLocaleDateString('en-GB', { month: 'short' }) + (showYear ? ' ' + d.getFullYear() : '')));
+      }
+    }
+    const now = startOfToday();
+    if (now >= start && now <= end) {
+      const tx = xOf(now);
+      svg.appendChild(el('line', { x1: tx.toFixed(1), y1: padT - 13, x2: tx.toFixed(1), y2: H - 4, class: 'todayline' }));
+      svg.appendChild(el('text', { x: (tx + 3).toFixed(1), y: H - 6, class: 'todaylbl' }, 'Today'));
+    }
+
+    // ---- one dumbbell marker for an item, centred on y ----
+    function drawMarker(it, y, mCode) {
+      const isMajor = it.weightPct >= threshold;
+      const color = it.type === 'quiz' ? 'var(--series-quiz)' : 'var(--series-assign)';
+      const od = toDate(it.opensAt), dd = toDate(it.dueAt);
+      const past = dd < start, earlier = od < start;
+      const xOpen = cx(od), xDue = cx(dd), r = 4 + Math.min(6, it.weightPct / 6);
+      const g = el('g', {}); if (past) g.setAttribute('opacity', '.45');
+      if (xDue > xOpen + 1) {
+        g.appendChild(el('line', { x1: xOpen.toFixed(1), y1: y, x2: xDue.toFixed(1), y2: y, stroke: color, 'stroke-width': 2.5, opacity: .38, class: 'connector' }));
+        if (!earlier) g.appendChild(el('circle', { cx: xOpen.toFixed(1), cy: y, r: 3, fill: color, 'fill-opacity': .5, stroke: 'var(--panel)', 'stroke-width': 2 }));
+      }
+      if (earlier) g.appendChild(el('text', { x: (xOpen - 2).toFixed(1), y: (y + 4.5).toFixed(1), 'text-anchor': 'end', class: 'earlier' }, '‹'));
+      // special-access extension: a later overridden date, drawn in teal after the due date
+      if (it.saMax) {
+        const sd = toDate(it.saMax);
+        if (sd > dd) {
+          const xSa = cx(sd), SA = '#14b8a6';
+          g.appendChild(el('line', { x1: xDue.toFixed(1), y1: y, x2: xSa.toFixed(1), y2: y, stroke: SA, 'stroke-width': 2, 'stroke-dasharray': '2 3', class: 'connector' }));
+          g.appendChild(el('circle', { cx: xSa.toFixed(1), cy: y, r: 3.6, fill: SA, stroke: 'var(--panel)', 'stroke-width': 1.5 }));
+        }
+      }
+      if (isMajor) g.appendChild(el('circle', { cx: xDue.toFixed(1), cy: y, r: (r + 3).toFixed(1), fill: 'none', stroke: 'var(--ink-primary)', 'stroke-width': 2 }));
+      g.appendChild(el('circle', { cx: xDue.toFixed(1), cy: y, r: r.toFixed(1), fill: color, stroke: 'var(--panel)', 'stroke-width': 2 }));
+      if (it.saCount > 0) {
+        g.appendChild(el('circle', { cx: (xDue + r + 3).toFixed(1), cy: (y - r - 3).toFixed(1), r: 6.5, fill: 'var(--muted)', stroke: 'var(--panel)', 'stroke-width': 1.5 }));
+        g.appendChild(el('text', { x: (xDue + r + 3).toFixed(1), y: (y - r - 0.3).toFixed(1), 'text-anchor': 'middle', 'font-size': 8, fill: 'var(--panel)', 'font-weight': 700 }, it.saCount));
+      }
+      g.style.cursor = 'default';
+      g.addEventListener('mouseenter', e => showTip(e,
+        '<b>' + escapeHtml(it.name) + '</b><br><span class="t-sub">' + mCode + ' · ' + (it.type === 'quiz' ? 'Quiz' : 'Assignment') + ' · ' + it.weightPct + '%' +
+        (isMajor ? ' · major' : '') + (past ? ' · past' : earlier ? ' · in progress' : '') + '<br>' +
+        fmtFull(od) + ' → ' + fmtFull(dd) +
+        (it.saCount ? '<br>' + it.saCount + ' on special access' + (it.saMax && toDate(it.saMax) > dd ? ' — latest ' + fmtFull(toDate(it.saMax)) : '') : '') + '</span>'));
+      g.addEventListener('mousemove', moveTip); g.addEventListener('mouseleave', hideTip);
+      svg.appendChild(g);
+    }
+
+    // ---- draw rows ----
+    let stripe = 0;
+    layout.forEach(row => {
+      if (row.kind === 'header') {
+        const m = row.mod, midY = row.y + row.h / 2, labelY = row.collapsed ? row.y + 17 : midY + 4;
+        svg.appendChild(el('rect', { x: 0, y: row.y.toFixed(1), width: W, height: row.h, fill: 'var(--panel-hover)', rx: 6 }));
+        svg.appendChild(el('text', { x: 12, y: (midY + 4).toFixed(1), class: 'caret' }, row.collapsed ? '▸' : '▾'));
+        const ll = el('text', { x: 26, y: labelY.toFixed(1), class: 'lane-label' }, trunc(m.name, 24));
+        ll.appendChild(el('title', {}, m.name));
+        svg.appendChild(ll);
+        svg.appendChild(el('text', { x: (gutter - 8).toFixed(1), y: labelY.toFixed(1), 'text-anchor': 'end', class: 'lane-count' }, row.items.length + (row.items.length === 1 ? ' item' : ' items')));
+        const hit = el('rect', { x: 0, y: row.y.toFixed(1), width: gutter, height: row.h, fill: 'transparent', class: 'lane-head-hit' });
+        hit.addEventListener('click', () => { const id = String(m.id); if (collapsed.has(id)) collapsed.delete(id); else collapsed.add(id); renderSwimlane(); });
+        svg.appendChild(hit);
+        if (row.collapsed) { const my = row.y + row.h - 14; row.items.forEach(it => drawMarker(it, my, m.name)); }
+      } else {
+        const it = row.item, midY = row.y + row.h / 2;
+        if (stripe++ % 2 === 0) svg.appendChild(el('rect', { x: gutter - 6, y: row.y.toFixed(1), width: W - gutter + 6, height: row.h, fill: 'var(--panel-2)' }));
+        const color = it.type === 'quiz' ? 'var(--series-quiz)' : 'var(--series-assign)';
+        svg.appendChild(el('circle', { cx: 32, cy: midY, r: 4, fill: color }));
+        svg.appendChild(el('text', { x: 44, y: (midY - 2).toFixed(1), class: 'item-name' }, trunc(it.name, 20)));
+        svg.appendChild(el('text', { x: 44, y: (midY + 9).toFixed(1), class: 'item-sub' }, it.weightPct + '%' + (it.saCount ? ' · ' + it.saCount + ' special access' : '')));
+        drawMarker(it, midY, row.mod.name);
+      }
+    });
+
+    host.appendChild(svg);
+    $('legend').innerHTML =
+      '<span class="key"><span class="swatch" style="background:var(--series-assign)"></span>Assignment</span>' +
+      '<span class="key"><span class="swatch" style="background:var(--series-quiz)"></span>Quiz</span>' +
+      '<span class="key"><span class="swatch ring"></span>Major item (≥ ' + threshold + '%)</span>' +
+      '<span class="key"><span class="swatch" style="background:#14b8a6"></span>special-access date</span>' +
+      '<span class="key"><span class="swatch badge">N</span>students extended</span>' +
+      '<span class="key">‹ opened before today</span>';
+  }
+  function trunc(s, n) { s = s || ''; return s.length > n ? s.slice(0, n - 1) + '…' : s; }
+
+  // ============================================================= render: table
+  let sortKey = 'due', sortDir = 1;
+  function renderTable() {
+    const host = $('tablewrap');
+    const items = inScopeItems().slice();
+    const modName = new Map(D.modules.map(m => [m.id, m.name]));
+    if (!items.length) { host.innerHTML = '<div class="empty">No items in scope.</div>'; return; }
+    items.sort((a, b) => {
+      let av, bv;
+      switch (sortKey) {
+        case 'module': av = String(modName.get(a.mod)); bv = String(modName.get(b.mod)); break;
+        case 'name': av = a.name; bv = b.name; break;
+        case 'type': av = a.type; bv = b.type; break;
+        case 'weight': av = a.weightPct; bv = b.weightPct; break;
+        case 'sa': av = a.saCount; bv = b.saCount; break;
+        case 'opens': av = a.opensAt; bv = b.opensAt; break;
+        default: av = a.dueAt; bv = b.dueAt;
+      }
+      return av < bv ? -sortDir : av > bv ? sortDir : 0;
+    });
+    const cols = [['module', 'Module'], ['name', 'Item'], ['type', 'Type'], ['opens', 'Opens'], ['due', 'Due'], ['weight', 'Weight'], ['sa', 'Special access']];
+    let html = '<table><thead><tr>' + cols.map(([k, l]) => '<th data-k="' + k + '">' + l + (sortKey === k ? (sortDir === 1 ? ' ▲' : ' ▼') : '') + '</th>').join('') + '</tr></thead><tbody>';
+    for (const it of items) {
+      const isMajor = it.weightPct >= threshold;
+      const color = it.type === 'quiz' ? 'var(--series-quiz)' : 'var(--series-assign)';
+      html += '<tr><td>' + escapeHtml(modName.get(it.mod)) + '</td>' +
+        '<td>' + escapeHtml(it.name) + (isMajor ? ' <span class="chip major">Major</span>' : '') + '</td>' +
+        '<td><span class="typebadge"><span class="dot" style="background:' + color + '"></span>' + (it.type === 'quiz' ? 'Quiz' : 'Assignment') + '</span></td>' +
+        '<td>' + fmtFull(toDate(it.opensAt)) + '</td><td>' + fmtFull(toDate(it.dueAt)) + '</td>' +
+        '<td class="num">' + it.weightPct + '%</td>' +
+        '<td>' + (it.saCount ? '<span class="chip sa">' + it.saCount + ' modified</span>' : '—') + '</td></tr>';
+    }
+    host.innerHTML = html + '</tbody></table>';
+    host.querySelectorAll('th').forEach(th => th.addEventListener('click', () => {
+      const k = th.dataset.k;
+      if (sortKey === k) sortDir = -sortDir; else { sortKey = k; sortDir = 1; }
+      renderTable();
+    }));
+  }
+
+  function renderAll() { renderKpis(); renderLoadStrip(); renderLoadDetail(); renderSwimlane(); renderTable(); }
+
+  // ============================================================= init
+  function initRoles() {
+    const roles = distinctRoles();
+    const saved = savedRoles();
+    if (saved) { selectedRoles = new Set(roles.filter(r => saved.has(r))); }
+    if (!selectedRoles.size) selectedRoles = new Set(roles);
+  }
+  function initSemesters() {
+    const sems = distinctSemesters();
+    const saved = savedSemesters();
+    if (saved) { selectedSemesters = new Set(sems.filter(s => saved.has(s))); }
+    if (!selectedSemesters.size) selectedSemesters = new Set(sems);
+  }
+
+  function showError(msg) {
+    MODE = 'error';
+    D = { modules: [] }; itemsByMod = {}; selectedRoles = new Set(); selectedSemesters = new Set();
+    setBadge('error', 'Not connected');
+    banner('error', 'Couldn’t reach the Brightspace API from here. Add this file to a course as a widget or a hidden content page and open it there — it reads your modules using your own login. <span class="err-detail">(' + escapeHtml(String(msg)) + ')</span>');
+    renderRoleFilter(); renderSemesterFilter(); renderModPicker(); renderAll();
+  }
+
+  async function init(isRefresh) {
+    loadPrefs();
+    $('threshRange').value = threshold; $('threshReadout').textContent = threshold + '%'; setThreshFill();
+    setBadge('info', isRefresh ? 'Refreshing…' : 'Connecting…');
+    banner('info', '<span class="spinner"></span> Connecting to Brightspace…');
+    try {
+      await API.versions();
+      const enr = await fetchEnrollments();
+      const sel = savedIds();
+      const mods = enr.filter(isCourseOffering).map(e => toModule(e, sel));
+      if (!mods.length) throw new Error('No course offerings found for this account');
+      MODE = 'live';
+      D = { modules: mods };
+      itemsByMod = {};
+      banner('info', '<span class="spinner"></span> Reading semesters…');
+      try { await attachSemesters(mods); } catch (e) {}
+      initRoles(); initSemesters();
+      const chosen = mods.filter(m => m.on);
+      for (let i = 0; i < chosen.length; i++) {
+        banner('info', '<span class="spinner"></span> Loading ' + escapeHtml(chosen[i].name) + ' (' + (i + 1) + '/' + chosen.length + ')…');
+        try { await ensureLoaded(chosen[i]); } catch (e) { itemsByMod[chosen[i].id] = []; }
+      }
+      banner(null);
+      setBadge('live', 'Live · ' + mods.length + ' modules');
+      renderRoleFilter(); renderSemesterFilter(); renderModPicker(); renderAll();
+    } catch (e) {
+      console.warn('Deadline Radar — live load failed:', e);
+      showError(e && e.message ? e.message : e);
+    }
+  }
+
+  init(false);
+})();
+</script>
+</body>
+</html>
