@@ -1,5 +1,7 @@
 # Deadline Radar
 
+Part of my Brightspace tooling showcase, live at **<https://john-morrissey-ul.github.io>**.
+
 A lightweight Brightspace (D2L) widget that shows the assignment and quiz windows across **all the modules you pick** on one timeline, filtered by the role(s) you hold, and flags the weeks where too much lands on students at once — weighted by each item's **share of the module grade**, not a raw count.
 
 It answers a question no single-course view in Brightspace can: *is my programme piling heavy assessment into the same few weeks?* Built for programme coordinators and anyone teaching across several modules.
